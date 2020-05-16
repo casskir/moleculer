@@ -31,6 +31,7 @@ type Payload interface {
 	Exists() bool
 	IsError() bool
 	Error() error
+	ErrorPayload() Payload
 	Value() interface{}
 	ValueArray() []interface{}
 	Int() int
@@ -51,13 +52,15 @@ type Payload interface {
 	Time() time.Time
 	TimeArray() []time.Time
 	Array() []Payload
+	At(index int) Payload
 	Len() int
-	Get(path string) Payload
+	Get(path string, defaultValue ...interface{}) Payload
 	//Only return a payload containing only the field specified
 	Only(path string) Payload
 	IsArray() bool
 	IsMap() bool
 	ForEach(iterator func(key interface{}, value Payload) bool)
+	MapOver(tranform func(in Payload) Payload) Payload
 }
 
 // ActionSchema is used by the validation engine to check if parameters sent to the action are valid.
@@ -141,6 +144,8 @@ type Config struct {
 	Created                    func()
 	Started                    func()
 	Stopped                    func()
+
+	Services map[string]interface{}
 }
 
 var DefaultConfig = Config{

@@ -1,7 +1,11 @@
 package serializer
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
+
 	"sort"
 	"strconv"
 	"time"
@@ -44,7 +48,50 @@ func (serializer JSONSerializer) BytesToPayload(bytes *[]byte) moleculer.Payload
 	return payload
 }
 
+// ReaderToPayload transform an io.Reader into a Payload assusming the contes is a valid json :)
+func (serializer JSONSerializer) ReaderToPayload(r io.Reader) moleculer.Payload {
+	buf := bytes.Buffer{}
+	buf.ReadFrom(r)
+	json := buf.String()
+	if !gjson.Valid(json) {
+		return payload.New(errors.New("invalid json"))
+	}
+	result := gjson.Parse(json)
+	payload := JSONPayload{result, serializer.logger}
+	return payload
+}
+
+//MapToString serialize a map into a string
+//This implementation uses the standard library json pkg and it needs to be compared with others for performance.
+//Performance: it should be experimented with multiple implementations. This is just he initial one.
+func (serializer JSONSerializer) MapToString(m interface{}) string {
+	r, err := json.Marshal(m)
+	if err != nil {
+		serializer.logger.Errorln("Error trying to serialize a map. error: ", err)
+		panic(err)
+	}
+	s := string(r)
+	return s
+}
+
+//StringToMap deserialize a string (json) into map
+//Same implementation and performance notes as MapToString
+func (serializer JSONSerializer) StringToMap(j string) map[string]interface{} {
+	m := map[string]interface{}{}
+	err := json.Unmarshal([]byte(j), &m)
+	if err != nil {
+		serializer.logger.Errorln("Error trying to deserialize a map from json: " + j)
+		serializer.logger.Errorln("error: ", err)
+		panic(err)
+	}
+	return m
+}
+
 func (serializer JSONSerializer) PayloadToBytes(payload moleculer.Payload) []byte {
+	return []byte(serializer.PayloadToString(payload))
+}
+
+func (serializer JSONSerializer) PayloadToString(payload moleculer.Payload) string {
 	var err error
 	jp, isJson := payload.(JSONPayload)
 	if !isJson {
@@ -53,7 +100,7 @@ func (serializer JSONSerializer) PayloadToBytes(payload moleculer.Payload) []byt
 			if err != nil {
 				panic(err)
 			}
-			return []byte(jp.result.String())
+			return jp.result.String()
 		}
 		rawMap := payload.RawMap()
 		if payload.IsError() {
@@ -64,16 +111,16 @@ func (serializer JSONSerializer) PayloadToBytes(payload moleculer.Payload) []byt
 			if err != nil {
 				panic(err)
 			}
-			return []byte(jp.result.String())
+			return jp.result.String()
 		}
 		json, err := sjson.Set("{root:false}", "root", payload.Value())
 		if err != nil {
 			panic(err)
 		}
 		jp = JSONPayload{gjson.Get(json, "root"), serializer.logger}
-		return []byte(jp.result.String())
+		return jp.result.String()
 	}
-	return []byte(jp.result.String())
+	return jp.result.String()
 }
 
 func (jpayload JSONPayload) Remove(fields ...string) moleculer.Payload {
@@ -205,9 +252,14 @@ func (serializer JSONSerializer) PayloadToContextMap(message moleculer.Payload) 
 	return serializer.contextMap(message.RawMap())
 }
 
-func (payload JSONPayload) Get(path string) moleculer.Payload {
-	result := payload.result.Get(path)
-	message := JSONPayload{result, payload.logger}
+func (jp JSONPayload) Get(path string, defaultValue ...interface{}) moleculer.Payload {
+	result := jp.result.Get(path)
+	if !result.Exists() && len(defaultValue) > 1 {
+		return payload.New(defaultValue)
+	} else if !result.Exists() && len(defaultValue) > 0 {
+		return payload.New(defaultValue[0])
+	}
+	message := JSONPayload{result, jp.logger}
 	return message
 }
 
@@ -446,6 +498,17 @@ func (payload JSONPayload) TimeArray() []time.Time {
 	return nil
 }
 
+func (payload JSONPayload) At(index int) moleculer.Payload {
+	if payload.IsArray() {
+		source := payload.result.Array()
+		if index >= 0 && index < len(source) {
+			item := source[index]
+			return JSONPayload{item, payload.logger}
+		}
+	}
+	return nil
+}
+
 func (payload JSONPayload) Array() []moleculer.Payload {
 	if payload.IsArray() {
 		source := payload.result.Array()
@@ -481,6 +544,18 @@ func (payload JSONPayload) ForEach(iterator func(key interface{}, value molecule
 	})
 }
 
+func (p JSONPayload) MapOver(transform func(in moleculer.Payload) moleculer.Payload) moleculer.Payload {
+	if p.IsArray() {
+		list := []moleculer.Payload{}
+		for _, value := range p.Array() {
+			list = append(list, transform(value))
+		}
+		return payload.New(list)
+	} else {
+		return payload.Error("payload.MapOver can only deal with array payloads.")
+	}
+}
+
 func (payload JSONPayload) Bool() bool {
 	return payload.result.Bool()
 }
@@ -500,6 +575,13 @@ func (payload JSONPayload) IsError() bool {
 func (payload JSONPayload) Error() error {
 	if payload.IsError() {
 		return errors.New(payload.Get("error").String())
+	}
+	return nil
+}
+
+func (p JSONPayload) ErrorPayload() moleculer.Payload {
+	if p.IsError() {
+		return p
 	}
 	return nil
 }
