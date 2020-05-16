@@ -1,13 +1,14 @@
 package amqp
 
 import (
+	"sort"
+	"sync"
+	"time"
+
 	"github.com/moleculer-go/moleculer"
 	"github.com/moleculer-go/moleculer/broker"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"sort"
-	"sync"
-	"time"
 )
 
 var queues = []string{
@@ -163,7 +164,10 @@ var _ = Describe("Test AMQPTransporter", func() {
 			for _, bkr := range brokers {
 				bkr.Start()
 			}
-			time.Sleep(time.Second)
+
+			if err := client.WaitForNodes(worker1.LocalNode().GetID(), worker2.LocalNode().GetID(), worker3.LocalNode().GetID()); err != nil {
+				panic(err)
+			}
 		})
 		AfterEach(func() {
 			for _, bkr := range brokers {
@@ -221,6 +225,8 @@ var _ = Describe("Test AMQPTransporter", func() {
 			worker2.Stop()
 			worker3.Stop()
 
+			time.Sleep(time.Second)
+
 			wg := sync.WaitGroup{}
 			for i := 0; i < 3; i++ {
 				wg.Add(1)
@@ -250,7 +256,7 @@ var _ = Describe("Test AMQPTransporter", func() {
 		})
 	})
 
-	Describe("Test AMQPTransporter event emit with built-in balancer", func() {
+	XDescribe("Test AMQPTransporter event emit with built-in balancer", func() {
 		var logs []string
 
 		pub := createEmitWorker("pub", "emit-handler", &logs)
@@ -264,10 +270,13 @@ var _ = Describe("Test AMQPTransporter", func() {
 		BeforeEach(func() {
 			logs = nil
 
+			wg := waitServicesNum(pub, 4)
+
 			for _, bkr := range brokers {
 				bkr.Start()
 			}
-			time.Sleep(time.Second)
+
+			wg.Wait()
 		})
 
 		// Stop services and clear queues
@@ -321,16 +330,18 @@ var _ = Describe("Test AMQPTransporter", func() {
 		BeforeEach(func() {
 			logs = nil
 
-			go func() {
-				time.Sleep(1500 * time.Millisecond)
-				sub3.Start()
-			}()
+			wg := waitServices(pub, []string{"pub", "sub1", "sub2"})
 
 			pub.Start()
 			sub1.Start()
 			sub2.Start()
 
-			time.Sleep(time.Second)
+			wg.Wait()
+
+			go func() {
+				time.Sleep(time.Second)
+				sub3.Start()
+			}()
 		})
 
 		AfterEach(func() {
