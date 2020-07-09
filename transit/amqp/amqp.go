@@ -158,6 +158,8 @@ func (t *AmqpTransporter) Connect() chan error {
 				// recovery subscribers
 				if err := t.recoverSubscribers(); err != nil {
 					t.logger.Error(err)
+
+					t.closeConnection()
 					continue
 				}
 
@@ -231,36 +233,36 @@ func (t *AmqpTransporter) closeConnection() {
 		for _, bind := range t.bindings {
 			if channel, ok := t.subscriberChannels[bind.channelName]; ok {
 				if err := channel.QueueUnbind(bind.queueName, bind.pattern, bind.topic, nil); err != nil {
-					t.logger.Warnf("AMQP Disconnect() - Can't unbind queue '%#v': %s", bind, err)
+					t.logger.Errorf("AMQP Disconnect() - Can't unbind queue '%#v': %s", bind, err)
 				}
 			}
 		}
 
+		t.subscribers = []subscriber{}
+		t.bindings = []binding{}
+		t.consumers = sync.Map{}
+		t.connectionDisconnecting = true
+
 		for name, channel := range t.subscriberChannels {
 			if err := channel.Close(); err != nil {
-				t.logger.Warnf("AMQP Disconnect() - Channel '%s' close error: %s", name, err)
+				t.logger.Errorf("AMQP Disconnect() - Channel '%s' close error: %s", name, err)
 			}
 		}
 
+		t.subscriberChannels = map[string]*amqp.Channel{}
+
 		if err := t.publishChannel.Close(); err != nil {
-			t.logger.Warnf("AMQP Disconnect() - Channel 'publish' close error: %s", err)
+			t.logger.Errorf("AMQP Disconnect() - Channel 'publish' close error: %s", err)
 		}
+
+		t.publishChannel = nil
 
 		if err := t.connection.Close(); err != nil {
-			t.logger.Warnf("AMQP Disconnect() - Connection close error: %s", err)
+			t.logger.Errorf("AMQP Disconnect() - Connection close error: %s", err)
 		}
+
+		t.connection = nil
 	}
-
-	t.subscribers = []subscriber{}
-	t.bindings = []binding{}
-	t.consumers = sync.Map{}
-	t.connectionDisconnecting = true
-
-	t.subscriberChannels = map[string]*amqp.Channel{}
-
-	t.publishChannel = nil
-
-	t.connection = nil
 }
 
 func (t *AmqpTransporter) Subscribe(command, nodeID string, handler transit.TransportHandler) {
@@ -313,7 +315,7 @@ func (t *AmqpTransporter) subscribeInternal(subscriber subscriber) error {
 		needAck := subscriber.command == "REQ"
 		autoDelete, durable, exclusive, args := t.getQueueOptions(subscriber.command, false)
 		if _, err := channel.QueueDeclare(topic, durable, autoDelete, exclusive, false, args); err != nil {
-			return err
+			return nil
 		}
 
 		go t.doConsume(channel, topic, needAck, subscriber.handler)
