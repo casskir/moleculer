@@ -51,7 +51,6 @@ type AmqpTransporter struct {
 	nodeID             string
 	subscribers        []subscriber
 	bindings           []binding
-	consumers          sync.Map
 	subscriberChannels map[string]*amqp.Channel
 	publishChannel     *amqp.Channel
 	publishMutex       sync.Mutex
@@ -240,7 +239,6 @@ func (t *AmqpTransporter) closeConnection() {
 
 		t.subscribers = []subscriber{}
 		t.bindings = []binding{}
-		t.consumers = sync.Map{}
 		t.connectionDisconnecting = true
 
 		for name, channel := range t.subscriberChannels {
@@ -277,8 +275,6 @@ func (t *AmqpTransporter) Subscribe(command, nodeID string, handler transit.Tran
 }
 
 func (t *AmqpTransporter) recoverSubscribers() error {
-	t.consumers = sync.Map{}
-
 	for _, subscriber := range t.subscribers {
 		if err := t.subscribeInternal(subscriber); err != nil {
 			return err
@@ -414,12 +410,6 @@ func (t *AmqpTransporter) SetSerializer(serializer serializer.Serializer) {
 
 func (t *AmqpTransporter) doConsume(channel *amqp.Channel, queueName string, needAck bool, handler transit.TransportHandler) {
 	t.logger.Debug("AMQP doConsume() - queue: ", queueName)
-
-	// Check that consumer for queue already exist
-	if _, ok := t.consumers.Load(queueName); ok {
-		return
-	}
-	t.consumers.Store(queueName, handler)
 
 	msgs, err := channel.Consume(queueName, "", !needAck, false, false, true, t.opts.ConsumeOptions)
 	if err != nil {
