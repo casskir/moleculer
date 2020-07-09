@@ -2,7 +2,6 @@ package util
 
 import (
 	"math/rand"
-	"sync"
 	"time"
 )
 
@@ -14,12 +13,8 @@ const (
 )
 
 var randomSource = rand.NewSource(time.Now().UnixNano())
-var randomSourceMu = sync.Mutex{}
 
 func RandomString(size int) string {
-	randomSourceMu.Lock()
-	defer randomSourceMu.Unlock()
-
 	buffer := make([]byte, size)
 	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
 	for index, cache, remain := size-1, randomSource.Int63(), letterIdxMax; index >= 0; {
