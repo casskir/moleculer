@@ -164,10 +164,7 @@ var _ = Describe("Test AMQPTransporter", func() {
 			for _, bkr := range brokers {
 				bkr.Start()
 			}
-
-			if err := client.WaitForNodes(worker1.LocalNode().GetID(), worker2.LocalNode().GetID(), worker3.LocalNode().GetID()); err != nil {
-				panic(err)
-			}
+			time.Sleep(time.Second)
 		})
 		AfterEach(func() {
 			for _, bkr := range brokers {
@@ -225,8 +222,6 @@ var _ = Describe("Test AMQPTransporter", func() {
 			worker2.Stop()
 			worker3.Stop()
 
-			time.Sleep(time.Second)
-
 			wg := sync.WaitGroup{}
 			for i := 0; i < 3; i++ {
 				wg.Add(1)
@@ -270,13 +265,10 @@ var _ = Describe("Test AMQPTransporter", func() {
 		BeforeEach(func() {
 			logs = nil
 
-			wg := waitServicesNum(pub, 4)
-
 			for _, bkr := range brokers {
 				bkr.Start()
 			}
-
-			wg.Wait()
+			time.Sleep(time.Second)
 		})
 
 		// Stop services and clear queues
@@ -330,18 +322,16 @@ var _ = Describe("Test AMQPTransporter", func() {
 		BeforeEach(func() {
 			logs = nil
 
-			wg := waitServices(pub, []string{"pub", "sub1", "sub2"})
+			go func() {
+				time.Sleep(1500 * time.Millisecond)
+				sub3.Start()
+			}()
 
 			pub.Start()
 			sub1.Start()
 			sub2.Start()
 
-			wg.Wait()
-
-			go func() {
-				time.Sleep(time.Second)
-				sub3.Start()
-			}()
+			time.Sleep(time.Second)
 		})
 
 		AfterEach(func() {

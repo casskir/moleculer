@@ -9,7 +9,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,11 +16,12 @@ const (
 	DurationNotDefined = time.Duration(-1)
 )
 
+type safeHandler func(moleculer.Payload) error
+
 type binding struct {
-	channelName string
-	queueName   string
-	topic       string
-	pattern     string
+	queueName string
+	topic     string
+	pattern   string
 }
 
 type subscriber struct {
@@ -47,13 +47,11 @@ type AmqpTransporter struct {
 	connectionDisconnecting bool
 	connectionRecovering    bool
 	connection              *amqp.Connection
+	channel                 *amqp.Channel
 
-	nodeID             string
-	subscribers        []subscriber
-	bindings           []binding
-	subscriberChannels map[string]*amqp.Channel
-	publishChannel     *amqp.Channel
-	publishMutex       sync.Mutex
+	nodeID      string
+	subscribers []subscriber
+	bindings    []binding
 }
 
 type AmqpOptions struct {
@@ -128,8 +126,6 @@ func CreateAmqpTransporter(options AmqpOptions) transit.Transport {
 	return &AmqpTransporter{
 		opts:   &options,
 		logger: options.Logger,
-
-		subscriberChannels: map[string]*amqp.Channel{},
 	}
 }
 
@@ -155,11 +151,8 @@ func (t *AmqpTransporter) Connect() chan error {
 				endChan <- nil
 			} else {
 				// recovery subscribers
-				if err := t.recoverSubscribers(); err != nil {
-					t.logger.Error(err)
-
-					t.closeConnection()
-					continue
+				for _, subscriber := range t.subscribers {
+					t.subscribeInternal(subscriber)
 				}
 
 				t.connectionRecovering = false
@@ -197,14 +190,14 @@ func (t *AmqpTransporter) doConnect(uri string) (chan *amqp.Error, error) {
 
 	t.logger.Info("AMQP is connected")
 
-	if t.publishChannel, err = t.connection.Channel(); err != nil {
-		return nil, errors.Wrap(err, "AMQP failed to create channel 'publish'")
+	if t.channel, err = t.connection.Channel(); err != nil {
+		return nil, errors.Wrap(err, "AMQP failed to create channel")
 	}
 
-	t.logger.Debugf("AMQP 'publish' channel is created")
+	t.logger.Info("AMQP channel is created")
 
-	if err := t.publishChannel.Qos(t.opts.Prefetch, 0, false); err != nil {
-		return nil, errors.Wrapf(err, "AMQP failed set prefetch count for 'publish' channel")
+	if err := t.channel.Qos(t.opts.Prefetch, 0, false); err != nil {
+		return nil, errors.Wrap(err, "AMQP failed set prefetch count")
 	}
 
 	closeNotifyChan := make(chan *amqp.Error)
@@ -219,48 +212,38 @@ func (t *AmqpTransporter) Disconnect() chan error {
 	t.connectionDisconnecting = true
 
 	go func() {
-		t.closeConnection()
+		if t.connection != nil && t.channel != nil {
+			for _, bind := range t.bindings {
+				if err := t.channel.QueueUnbind(bind.queueName, bind.pattern, bind.topic, nil); err != nil {
+					t.logger.Errorf("AMQP Disconnect() - Can't unbind queue '%#v': %s", bind, err)
+				}
+			}
+
+			t.subscribers = []subscriber{}
+			t.bindings = []binding{}
+			t.connectionDisconnecting = true
+
+			if err := t.channel.Close(); err != nil {
+				t.logger.Error("AMQP Disconnect() - Channel close error: ", err)
+				errChan <- err
+				return
+			}
+
+			t.channel = nil
+
+			if err := t.connection.Close(); err != nil {
+				t.logger.Error("AMQP Disconnect() - Connection close error: ", err)
+				errChan <- err
+				return
+			}
+
+			t.connection = nil
+		}
 
 		errChan <- nil
 	}()
 
 	return errChan
-}
-
-func (t *AmqpTransporter) closeConnection() {
-	if t.connection != nil {
-		for _, bind := range t.bindings {
-			if channel, ok := t.subscriberChannels[bind.channelName]; ok {
-				if err := channel.QueueUnbind(bind.queueName, bind.pattern, bind.topic, nil); err != nil {
-					t.logger.Errorf("AMQP Disconnect() - Can't unbind queue '%#v': %s", bind, err)
-				}
-			}
-		}
-
-		t.subscribers = []subscriber{}
-		t.bindings = []binding{}
-		t.connectionDisconnecting = true
-
-		for name, channel := range t.subscriberChannels {
-			if err := channel.Close(); err != nil {
-				t.logger.Errorf("AMQP Disconnect() - Channel '%s' close error: %s", name, err)
-			}
-		}
-
-		t.subscriberChannels = map[string]*amqp.Channel{}
-
-		if err := t.publishChannel.Close(); err != nil {
-			t.logger.Errorf("AMQP Disconnect() - Channel 'publish' close error: %s", err)
-		}
-
-		t.publishChannel = nil
-
-		if err := t.connection.Close(); err != nil {
-			t.logger.Errorf("AMQP Disconnect() - Connection close error: %s", err)
-		}
-
-		t.connection = nil
-	}
 }
 
 func (t *AmqpTransporter) Subscribe(command, nodeID string, handler transit.TransportHandler) {
@@ -269,52 +252,26 @@ func (t *AmqpTransporter) Subscribe(command, nodeID string, handler transit.Tran
 	// Save subscribers for recovery logic
 	t.subscribers = append(t.subscribers, subscriber)
 
-	if err := t.subscribeInternal(subscriber); err != nil {
-		t.logger.Error(err)
-	}
+	t.subscribeInternal(subscriber)
 }
 
-func (t *AmqpTransporter) recoverSubscribers() error {
-	for _, subscriber := range t.subscribers {
-		if err := t.subscribeInternal(subscriber); err != nil {
-			return err
-		}
+func (t *AmqpTransporter) subscribeInternal(subscriber subscriber) {
+	if t.channel == nil {
+		return
 	}
-
-	return nil
-}
-
-func (t *AmqpTransporter) subscribeInternal(subscriber subscriber) error {
-	if t.connection == nil {
-		return nil
-	}
-
-	var channel *amqp.Channel
-	var err error
 
 	topic := t.topicName(subscriber.command, subscriber.nodeID)
-
-	if channel, err = t.connection.Channel(); err != nil {
-		return errors.Wrapf(err, "AMQP failed to create channel for topic '%s'", topic)
-	}
-
-	t.logger.Debugf("AMQP channel for topic '%s' is created", topic)
-
-	t.subscriberChannels[topic] = channel
-
-	if err := channel.Qos(t.opts.Prefetch, 0, false); err != nil {
-		return errors.Wrapf(err, "AMQP failed set prefetch count for channel '%s'", topic)
-	}
 
 	if subscriber.nodeID != "" {
 		// Some topics are specific to this node already, in these cases we don't need an exchange.
 		needAck := subscriber.command == "REQ"
 		autoDelete, durable, exclusive, args := t.getQueueOptions(subscriber.command, false)
-		if _, err := channel.QueueDeclare(topic, durable, autoDelete, exclusive, false, args); err != nil {
-			return nil
+		if _, err := t.channel.QueueDeclare(topic, durable, autoDelete, exclusive, false, args); err != nil {
+			t.logger.Error("AMQP Subscribe() - Queue declare error: ", err)
+			return
 		}
 
-		go t.doConsume(channel, topic, needAck, subscriber.handler)
+		go t.doConsume(topic, needAck, subscriber.handler)
 	} else {
 		// Create a queue specific to this nodeID so that this node can receive broadcasted messages.
 		queueName := t.prefix + "." + subscriber.command + "." + t.nodeID
@@ -328,27 +285,28 @@ func (t *AmqpTransporter) subscribeInternal(subscriber subscriber) error {
 		t.bindings = append(t.bindings, b)
 
 		autoDelete, durable, exclusive, args := t.getQueueOptions(subscriber.command, false)
-		if _, err := channel.QueueDeclare(queueName, durable, autoDelete, exclusive, false, args); err != nil {
-			return errors.Wrap(err, "AMQP Subscribe() - Queue declare error")
+		if _, err := t.channel.QueueDeclare(queueName, durable, autoDelete, exclusive, false, args); err != nil {
+			t.logger.Error("AMQP Subscribe() - Queue declare error: ", err)
+			return
 		}
 
 		durable, autoDelete, args = t.getExchangeOptions()
-		if err := channel.ExchangeDeclare(topic, "fanout", durable, autoDelete, false, false, args); err != nil {
-			return errors.Wrap(err, "AMQP Subscribe() - Exchange declare error")
+		if err := t.channel.ExchangeDeclare(topic, "fanout", durable, autoDelete, false, false, args); err != nil {
+			t.logger.Error("AMQP Subscribe() - Exchange declare error: ", err)
+			return
 		}
 
-		if err := channel.QueueBind(b.queueName, b.pattern, b.topic, false, nil); err != nil {
-			return errors.Wrap(err, "AMQP Subscribe() - Can't bind queue to exchange")
+		if err := t.channel.QueueBind(b.queueName, b.pattern, b.topic, false, nil); err != nil {
+			t.logger.Error("AMQP Subscribe() - Can't bind queue to exchange: ", err)
+			return
 		}
 
-		go t.doConsume(channel, queueName, false, subscriber.handler)
+		go t.doConsume(queueName, false, subscriber.handler)
 	}
-
-	return nil
 }
 
 func (t *AmqpTransporter) Publish(command, nodeID string, message moleculer.Payload) {
-	if t.connection == nil {
+	if t.channel == nil {
 		msg := fmt.Sprint("AMQP Publish() No connection -> command: ", command, " nodeID: ", nodeID)
 		t.logger.Error(msg)
 		panic(errors.New(msg))
@@ -361,15 +319,6 @@ func (t *AmqpTransporter) Publish(command, nodeID string, message moleculer.Payl
 	topic := t.topicName(command, nodeID)
 	routingKey := ""
 
-	t.publishMutex.Lock()
-	defer t.publishMutex.Unlock()
-
-	if t.publishChannel == nil {
-		msg := fmt.Sprint("AMQP Publish() No channel found -> command: ", command, " nodeID: ", nodeID)
-		t.logger.Error(msg)
-		panic(errors.New(msg))
-	}
-
 	if nodeID != "" {
 		routingKey = topic
 		topic = ""
@@ -381,7 +330,7 @@ func (t *AmqpTransporter) Publish(command, nodeID string, message moleculer.Payl
 		Body: data,
 	}
 
-	if err := t.publishChannel.Publish(topic, routingKey, false, false, msg); err != nil {
+	if err := t.channel.Publish(topic, routingKey, false, false, msg); err != nil {
 		t.logger.Warnf("AMQP Publish - Can't publish command: %s, nodeID: %s, error: %s", command, nodeID, err)
 	}
 }
@@ -408,10 +357,10 @@ func (t *AmqpTransporter) SetSerializer(serializer serializer.Serializer) {
 	t.serializer = serializer
 }
 
-func (t *AmqpTransporter) doConsume(channel *amqp.Channel, queueName string, needAck bool, handler transit.TransportHandler) {
+func (t *AmqpTransporter) doConsume(queueName string, needAck bool, handler transit.TransportHandler) {
 	t.logger.Debug("AMQP doConsume() - queue: ", queueName)
 
-	msgs, err := channel.Consume(queueName, "", !needAck, false, false, true, t.opts.ConsumeOptions)
+	msgs, err := t.channel.Consume(queueName, "", !needAck, false, false, true, t.opts.ConsumeOptions)
 	if err != nil {
 		t.logger.Errorf("AMQP doConsume - Can't start consume for queue '%s': %s", queueName, err)
 		return

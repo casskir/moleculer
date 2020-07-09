@@ -71,9 +71,6 @@ func mergeConfigs(baseConfig moleculer.Config, userConfig []*moleculer.Config) m
 			if config.DontWaitForNeighbours {
 				baseConfig.DontWaitForNeighbours = config.DontWaitForNeighbours
 			}
-			if config.WaitForDependenciesTimeout != 0 {
-				baseConfig.WaitForDependenciesTimeout = config.WaitForDependenciesTimeout
-			}
 
 			if config.Middlewares != nil {
 				baseConfig.Middlewares = config.Middlewares
@@ -190,7 +187,7 @@ func (broker *ServiceBroker) waitForDependencies(service *service.Service) {
 	}
 	start := time.Now()
 	for {
-		if !broker.started && !broker.starting {
+		if !broker.started {
 			break
 		}
 		found := true
